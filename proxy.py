@@ -94,6 +94,8 @@ class KeyPool:
         self._ban_duration = ban_duration
         self._failures: dict[str, int] = {k: 0 for k in keys}
         self._banned_until: dict[str, float] = {}
+        self._success_count: dict[str, int] = {k: 0 for k in keys}
+        self._total_count: dict[str, int] = {k: 0 for k in keys}
         self._lock = threading.Lock()
 
     def pick(self) -> str | None:
@@ -108,15 +110,31 @@ class KeyPool:
                 if not self._keys:
                     return None
                 return min(self._keys, key=lambda k: self._banned_until.get(k, 0))
-            return random.choice(available)
+            if len(available) == 1:
+                return available[0]
+            # 0.2 explore (random), 0.8 exploit (成功率前1/4中随机选)
+            if random.random() < 0.2:
+                return random.choice(available)
+            # exploit: pick from top-1/4 by success rate to spread load
+            sorted_keys = sorted(
+                available,
+                key=lambda k: self._success_count[k] / self._total_count[k]
+                    if self._total_count[k] > 0 else 0,
+                reverse=True,
+            )
+            top_n = max(1, len(sorted_keys) // 4)
+            return random.choice(sorted_keys[:top_n])
 
     def report_success(self, key: str):
         with self._lock:
             self._failures[key] = 0
+            self._success_count[key] = self._success_count.get(key, 0) + 1
+            self._total_count[key] = self._total_count.get(key, 0) + 1
 
     def report_failure(self, key: str):
         with self._lock:
             self._failures[key] = self._failures.get(key, 0) + 1
+            self._total_count[key] = self._total_count.get(key, 0) + 1
             if self._failures[key] >= self._threshold:
                 ban_until = time.time() + self._ban_duration
                 self._banned_until[key] = ban_until
