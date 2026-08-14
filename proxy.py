@@ -88,14 +88,30 @@ def load_config(path: str = '.env.yml') -> dict:
 # ---------------------------------------------------------------------------
 
 class KeyPool:
+    # EWMA + epsilon-greedy parameters
+    _ALPHA = 0.1       # learning rate
+    _EPSILON = 0.02    # exploration probability
+    _DELTA = 0.02      # min weight floor
+    _INIT_P = 0.9      # initial success rate estimate
+    # load penalty parameters
+    _GAMMA = 3         # exponential decay strength for 429 risk
+    _R0 = 0.2          # reference rate (rps) where penalty becomes noticeable
+    _K = 2             # penalty shape exponent
+    _COOLDOWN_429 = 3  # consecutive 429s to trigger cooldown
+    _COOLDOWN_DURATION = 10  # cooldown duration in seconds
+
     def __init__(self, keys: list, fail_threshold: int, ban_duration: int):
         self._keys = list(keys)
         self._threshold = fail_threshold
         self._ban_duration = ban_duration
         self._failures: dict[str, int] = {k: 0 for k in keys}
         self._banned_until: dict[str, float] = {}
-        self._success_count: dict[str, int] = {k: 0 for k in keys}
-        self._total_count: dict[str, int] = {k: 0 for k in keys}
+        self._ewma_p: dict[str, float] = {k: self._INIT_P for k in keys}
+        self._p429: dict[str, float] = {k: 0 for k in keys}
+        self._rate_ema: dict[str, float] = {k: 0 for k in keys}
+        self._consecutive_429: dict[str, int] = {k: 0 for k in keys}
+        self._cooldown_until: dict[str, float] = {k: 0 for k in keys}
+        self._last_pick_time: dict[str, float] = {k: 0 for k in keys}
         self._lock = threading.Lock()
 
     def pick(self) -> str | None:
@@ -103,44 +119,84 @@ class KeyPool:
             now = time.time()
             available = [
                 k for k in self._keys
-                if now >= self._banned_until.get(k, 0)
+                if now >= self._banned_until.get(k, 0) and now >= self._cooldown_until.get(k, 0)
             ]
             if not available:
-                # all banned — return least-recently-banned as fallback
+                # all banned/cooldown — return least-recently-restricted as fallback
                 if not self._keys:
                     return None
-                return min(self._keys, key=lambda k: self._banned_until.get(k, 0))
+                return min(self._keys, key=lambda k: max(self._banned_until.get(k, 0), self._cooldown_until.get(k, 0)))
             if len(available) == 1:
+                self._update_rate(available[0], now)
                 return available[0]
-            # 0.2 explore (random), 0.8 exploit (成功率前1/4中随机选)
-            if random.random() < 0.2:
-                return random.choice(available)
-            # exploit: pick from top-1/4 by success rate to spread load
-            sorted_keys = sorted(
-                available,
-                key=lambda k: self._success_count[k] / self._total_count[k]
-                    if self._total_count[k] > 0 else 0,
-                reverse=True,
-            )
-            top_n = max(1, len(sorted_keys) // 4)
-            return random.choice(sorted_keys[:top_n])
+            # epsilon-greedy: explore vs exploit
+            if random.random() < self._EPSILON:
+                picked = random.choice(available)
+                self._update_rate(picked, now)
+                return picked
+            # exploit: weighted random by EWMA success rate × 429 load penalty
+            weights = []
+            for k in available:
+                base = max(self._DELTA, self._ewma_p[k])
+                load_penalty = (self._rate_ema[k] / self._R0) ** self._K
+                risk_decay = 1.0
+                if self._p429[k] > 0:
+                    risk_decay = 1.0
+                    decay = -self._GAMMA * self._p429[k] * load_penalty
+                    try:
+                        risk_decay *= 2.718281828459045 ** decay
+                    except OverflowError:
+                        risk_decay = 0
+                weights.append(base * risk_decay if risk_decay > self._DELTA else self._DELTA)
+            total = sum(weights)
+            if total <= 0:
+                picked = random.choice(available)
+                self._update_rate(picked, now)
+                return picked
+            r = random.uniform(0, total)
+            cumulative = 0
+            for k, w in zip(available, weights):
+                cumulative += w
+                if r <= cumulative:
+                    self._update_rate(k, now)
+                    return k
+            picked = available[-1]
+            self._update_rate(picked, now)
+            return picked
+
+    def _update_rate(self, key: str, now: float):
+        dt = now - self._last_pick_time[key] if self._last_pick_time[key] > 0 else 1
+        instant_rate = 1 / dt if dt > 0 else 0
+        self._rate_ema[key] = (1 - self._ALPHA) * self._rate_ema[key] + self._ALPHA * instant_rate
+        self._last_pick_time[key] = now
 
     def report_success(self, key: str):
         with self._lock:
             self._failures[key] = 0
-            self._success_count[key] = self._success_count.get(key, 0) + 1
-            self._total_count[key] = self._total_count.get(key, 0) + 1
+            self._consecutive_429[key] = 0
+            self._ewma_p[key] = (1 - self._ALPHA) * self._ewma_p.get(key, self._INIT_P) + self._ALPHA
+            self._p429[key] = (1 - self._ALPHA) * self._p429.get(key, 0)
 
-    def report_failure(self, key: str):
+    def report_failure(self, key: str, status_code: int | None = None):
         with self._lock:
             self._failures[key] = self._failures.get(key, 0) + 1
-            self._total_count[key] = self._total_count.get(key, 0) + 1
+            self._ewma_p[key] = (1 - self._ALPHA) * self._ewma_p.get(key, self._INIT_P)
+            is_429 = status_code == 429
+            if is_429:
+                self._p429[key] = (1 - self._ALPHA) * self._p429.get(key, 0) + self._ALPHA
+                self._consecutive_429[key] += 1
+                if self._consecutive_429[key] >= self._COOLDOWN_429:
+                    self._cooldown_until[key] = time.time() + self._COOLDOWN_DURATION
+                    self._consecutive_429[key] = 0
+                    print(f"[KeyPool] key ...{key[-6:]} cooldown for {self._COOLDOWN_DURATION}s (consecutive 429)")
+            else:
+                self._p429[key] = (1 - self._ALPHA) * self._p429.get(key, 0)
+                self._consecutive_429[key] = 0
             if self._failures[key] >= self._threshold:
                 ban_until = time.time() + self._ban_duration
                 self._banned_until[key] = ban_until
                 self._failures[key] = 0
                 print(f"[KeyPool] key ...{key[-6:]} banned for {self._ban_duration}s")
-
 
 # ---------------------------------------------------------------------------
 # Proxy handler
@@ -201,7 +257,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         except urllib.error.HTTPError as e:
             if e.code in (401, 403, 429):
-                pool.report_failure(key)
+                pool.report_failure(key, e.code)
             self.send_response(e.code)
             for k, v in e.headers.items():
                 if k.lower() == 'transfer-encoding':
@@ -212,7 +268,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             if body_err:
                 self.wfile.write(body_err)
         except Exception as e:
-            pool.report_failure(key)
+            pool.report_failure(key, None)
             self.send_error(502, f"Upstream error: {e}")
 
     def do_GET(self):    self._proxy()
