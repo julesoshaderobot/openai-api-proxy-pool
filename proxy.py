@@ -8,6 +8,8 @@ import threading
 import time
 import urllib.request
 import urllib.error
+import collections
+import json
 from http.server import HTTPServer
 
 
@@ -93,15 +95,72 @@ class KeyPool:
     _EPSILON = 0.02    # exploration probability
     _DELTA = 0.02      # min weight floor
     _INIT_P = 0.9      # initial success rate estimate
+    _INIT_LATENCY = 1.0 # initial latency estimate (seconds)
+    _HISTORY_SIZE = 20  # max stored call records per key
 
-    def __init__(self, keys: list, fail_threshold: int, ban_duration: int):
+    def __init__(self, keys: list, fail_threshold: int, ban_duration: int, storage_path: str | None = None):
         self._keys = list(keys)
         self._threshold = fail_threshold
         self._ban_duration = ban_duration
         self._failures: dict[str, int] = {k: 0 for k in keys}
         self._banned_until: dict[str, float] = {}
         self._ewma_p: dict[str, float] = {k: self._INIT_P for k in keys}
+        self._ewma_latency: dict[str, float] = {k: self._INIT_LATENCY for k in keys}
+        self._history: dict[str, collections.deque] = {
+            k: collections.deque(maxlen=self._HISTORY_SIZE) for k in keys
+        }
         self._lock = threading.Lock()
+        self._storage_path = storage_path
+        if storage_path:
+            self._load()
+
+    def _load(self):
+        """Load history from storage path."""
+        if not self._storage_path or not os.path.exists(self._storage_path):
+            return
+        try:
+            with open(self._storage_path, encoding='utf-8') as f:
+                data = json.load(f)
+            for key, records in data.items():
+                if key in self._history:
+                    for ts, status, latency in records:
+                        self._history[key].append((ts, status, latency))
+                    # Recalculate EWMA from loaded history
+                    self._recalc_ewma(key)
+            print(f"[KeyPool] loaded history from {self._storage_path}")
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"[KeyPool] warning: failed to load history: {e}")
+
+    def _recalc_ewma(self, key: str):
+        """Recalculate EWMA success rate and latency from history."""
+        records = list(self._history[key])
+        if not records:
+            return
+        p = self._INIT_P
+        lat = self._INIT_LATENCY
+        for _, status, latency in records:
+            if status:
+                p = (1 - self._ALPHA) * p + self._ALPHA
+            else:
+                p = (1 - self._ALPHA) * p
+            lat = (1 - self._ALPHA) * lat + self._ALPHA * latency
+        self._ewma_p[key] = p
+        self._ewma_latency[key] = lat
+
+    def _persist(self):
+        """Persist history to storage path (called within lock)."""
+        if not self._storage_path:
+            return
+        data = {}
+        for key, records in self._history.items():
+            data[key] = list(records)
+        tmp = self._storage_path + '.tmp'
+        try:
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(data, f)
+            os.replace(tmp, self._storage_path)
+        except OSError as e:
+            print(f"[KeyPool] warning: failed to persist history: {e}")
 
     def pick(self) -> str | None:
         with self._lock:
@@ -120,8 +179,11 @@ class KeyPool:
             # epsilon-greedy: explore vs exploit
             if random.random() < self._EPSILON:
                 return random.choice(available)
-            # exploit: weighted random by EWMA success rate
-            weights = [max(self._DELTA, self._ewma_p[k]) for k in available]
+            # exploit: weighted random by EWMA success rate / latency
+            weights = [
+                max(self._DELTA, self._ewma_p[k] / (self._ewma_latency[k] + 0.1))
+                for k in available
+            ]
             total = sum(weights)
             r = random.uniform(0, total)
             cumulative = 0
@@ -131,20 +193,26 @@ class KeyPool:
                     return k
             return available[-1]
 
-    def report_success(self, key: str):
+    def report(self, key: str, success: bool, latency: float):
         with self._lock:
-            self._failures[key] = 0
-            self._ewma_p[key] = (1 - self._ALPHA) * self._ewma_p.get(key, self._INIT_P) + self._ALPHA
-
-    def report_failure(self, key: str):
-        with self._lock:
-            self._failures[key] = self._failures.get(key, 0) + 1
-            self._ewma_p[key] = (1 - self._ALPHA) * self._ewma_p.get(key, self._INIT_P)
-            if self._failures[key] >= self._threshold:
-                ban_until = time.time() + self._ban_duration
-                self._banned_until[key] = ban_until
+            now = time.time()
+            self._history[key].append((now, success, latency))
+            if success:
                 self._failures[key] = 0
-                print(f"[KeyPool] key ...{key[-6:]} banned for {self._ban_duration}s")
+                self._ewma_p[key] = (1 - self._ALPHA) * self._ewma_p.get(key, self._INIT_P) + self._ALPHA
+            else:
+                self._failures[key] = self._failures.get(key, 0) + 1
+                self._ewma_p[key] = (1 - self._ALPHA) * self._ewma_p.get(key, self._INIT_P)
+                if self._failures[key] >= self._threshold:
+                    ban_until = time.time() + self._ban_duration
+                    self._banned_until[key] = ban_until
+                    self._failures[key] = 0
+                    print(f"[KeyPool] key ...{key[-6:]} banned for {self._ban_duration}s")
+            self._ewma_latency[key] = (
+                (1 - self._ALPHA) * self._ewma_latency.get(key, self._INIT_LATENCY)
+                + self._ALPHA * latency
+            )
+            self._persist()
 
 
 # ---------------------------------------------------------------------------
@@ -186,9 +254,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         req = urllib.request.Request(target_url, data=body, headers=headers, method=self.command)
 
+        t0 = time.time()
         try:
             with urllib.request.urlopen(req, timeout=120) as resp:
-                pool.report_success(key)
+                pool.report(key, True, time.time() - t0)
                 self.send_response(resp.status)
                 for k, v in resp.headers.items():
                     if k.lower() == 'transfer-encoding':
@@ -206,7 +275,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         except urllib.error.HTTPError as e:
             if e.code in (401, 403, 429):
-                pool.report_failure(key)
+                pool.report(key, False, time.time() - t0)
             self.send_response(e.code)
             for k, v in e.headers.items():
                 if k.lower() == 'transfer-encoding':
@@ -217,7 +286,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             if body_err:
                 self.wfile.write(body_err)
         except Exception as e:
-            pool.report_failure(key)
+            pool.report(key, False, time.time() - t0)
             self.send_error(502, f"Upstream error: {e}")
 
     def do_GET(self):    self._proxy()
@@ -239,7 +308,7 @@ def main():
     if not cfg['api_keys']:
         raise SystemExit("No api_keys configured in .env.yml")
 
-    pool = KeyPool(cfg['api_keys'], cfg['fail_threshold'], cfg['ban_duration'])
+    pool = KeyPool(cfg['api_keys'], cfg['fail_threshold'], cfg['ban_duration'], os.environ.get('STORAGE_PATH'))
 
     ProxyHandler.key_pool = pool
     ProxyHandler.base_url = cfg['base_url']
