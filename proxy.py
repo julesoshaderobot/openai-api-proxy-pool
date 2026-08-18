@@ -111,25 +111,33 @@ class KeyPool:
         }
         self._lock = threading.Lock()
         self._storage_path = storage_path
+        self._history_file: str | None = None
         if storage_path:
+            os.makedirs(storage_path, exist_ok=True)
+            self._history_file = os.path.join(storage_path, 'history.json')
             self._load()
 
     def _load(self):
-        """Load history from storage path."""
-        if not self._storage_path or not os.path.exists(self._storage_path):
+        """Load state from storage directory."""
+        if not self._history_file or not os.path.exists(self._history_file):
             return
         try:
-            with open(self._storage_path, encoding='utf-8') as f:
+            with open(self._history_file, encoding='utf-8') as f:
                 data = json.load(f)
-            for key, records in data.items():
+            for key, records in data.get('history', {}).items():
                 if key in self._history:
                     for ts, status, latency in records:
                         self._history[key].append((ts, status, latency))
-                    # Recalculate EWMA from loaded history
                     self._recalc_ewma(key)
-            print(f"[KeyPool] loaded history from {self._storage_path}")
+            for key, until in data.get('banned_until', {}).items():
+                if key in self._failures:
+                    self._banned_until[key] = until
+            for key, count in data.get('failures', {}).items():
+                if key in self._failures:
+                    self._failures[key] = count
+            print(f"[KeyPool] loaded state from {self._history_file}")
         except (json.JSONDecodeError, OSError) as e:
-            print(f"[KeyPool] warning: failed to load history: {e}")
+            print(f"[KeyPool] warning: failed to load state: {e}")
 
     def _recalc_ewma(self, key: str):
         """Recalculate EWMA success rate and latency from history."""
@@ -148,19 +156,21 @@ class KeyPool:
         self._ewma_latency[key] = lat
 
     def _persist(self):
-        """Persist history to storage path (called within lock)."""
-        if not self._storage_path:
+        """Persist state to storage directory (called within lock)."""
+        if not self._history_file:
             return
-        data = {}
-        for key, records in self._history.items():
-            data[key] = list(records)
-        tmp = self._storage_path + '.tmp'
+        data = {
+            'history': {key: list(records) for key, records in self._history.items()},
+            'banned_until': dict(self._banned_until),
+            'failures': dict(self._failures),
+        }
+        tmp = self._history_file + '.tmp'
         try:
             with open(tmp, 'w', encoding='utf-8') as f:
                 json.dump(data, f)
-            os.replace(tmp, self._storage_path)
+            os.replace(tmp, self._history_file)
         except OSError as e:
-            print(f"[KeyPool] warning: failed to persist history: {e}")
+            print(f"[KeyPool] warning: failed to persist state: {e}")
 
     def pick(self) -> str | None:
         with self._lock:
@@ -177,6 +187,7 @@ class KeyPool:
             if len(available) == 1:
                 return available[0]
             # epsilon-greedy: explore vs exploit
+            random.seed = now
             if random.random() < self._EPSILON:
                 return random.choice(available)
             # exploit: weighted random by EWMA success rate / latency
