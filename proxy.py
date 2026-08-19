@@ -63,6 +63,8 @@ def load_config(path: str = '.env.yml') -> dict:
     cfg.setdefault('port', 8080)
     cfg.setdefault('fail_threshold', 3)
     cfg.setdefault('ban_duration', 600)
+    cfg.setdefault('ban_step', 3)
+    cfg.setdefault('max_ban', 86400)
     cfg.setdefault('api_keys', [])
 
     # Environment variables override config file (for Railway / cloud deploy)
@@ -81,9 +83,14 @@ def load_config(path: str = '.env.yml') -> dict:
     ban_duration_env = os.environ.get('BAN_DURATION')
     if ban_duration_env:
         cfg['ban_duration'] = int(ban_duration_env)
+    ban_step_env = os.environ.get('BAN_STEP')
+    if ban_step_env:
+        cfg['ban_step'] = int(ban_step_env)
+    max_ban_env = os.environ.get('MAX_BAN')
+    if max_ban_env:
+        cfg['max_ban'] = int(max_ban_env)
 
     return cfg
-
 
 # ---------------------------------------------------------------------------
 # Key pool with failure tracking and temporary ban
@@ -98,10 +105,12 @@ class KeyPool:
     _INIT_LATENCY = 1.0 # initial latency estimate (seconds)
     _HISTORY_SIZE = 20  # max stored call records per key
 
-    def __init__(self, keys: list, fail_threshold: int, ban_duration: int, storage_path: str | None = None):
+    def __init__(self, keys: list, fail_threshold: int, ban_duration: int, storage_path: str | None = None, ban_step: int = 3, max_ban: int = 86400):
         self._keys = list(keys)
         self._threshold = fail_threshold
         self._ban_duration = ban_duration
+        self._ban_step = ban_step
+        self._max_ban = max_ban
         self._failures: dict[str, int] = {k: 0 for k in keys}
         self._banned_until: dict[str, float] = {}
         self._ewma_p: dict[str, float] = {k: self._INIT_P for k in keys}
@@ -215,10 +224,10 @@ class KeyPool:
                 self._failures[key] = self._failures.get(key, 0) + 1
                 self._ewma_p[key] = (1 - self._ALPHA) * self._ewma_p.get(key, self._INIT_P)
                 if self._failures[key] >= self._threshold:
-                    ban_until = time.time() + self._ban_duration
+                    ban_secs = min(int(self._failures[key] / self._ban_step) * self._ban_duration, self._max_ban)
+                    ban_until = time.time() + ban_secs
                     self._banned_until[key] = ban_until
-                    self._failures[key] = 0
-                    print(f"[KeyPool] key ...{key[-6:]} banned for {self._ban_duration}s")
+                    print(f"[KeyPool] key ...{key[-6:]} banned for {ban_secs}s")
             self._ewma_latency[key] = (
                 (1 - self._ALPHA) * self._ewma_latency.get(key, self._INIT_LATENCY)
                 + self._ALPHA * latency
@@ -319,7 +328,7 @@ def main():
     if not cfg['api_keys']:
         raise SystemExit("No api_keys configured in .env.yml")
 
-    pool = KeyPool(cfg['api_keys'], cfg['fail_threshold'], cfg['ban_duration'], os.environ.get('STORAGE_PATH'))
+    pool = KeyPool(cfg['api_keys'], cfg['fail_threshold'], cfg['ban_duration'], os.environ.get('STORAGE_PATH'), cfg['ban_step'], cfg['max_ban'])
 
     ProxyHandler.key_pool = pool
     ProxyHandler.base_url = cfg['base_url']
@@ -328,7 +337,7 @@ def main():
     server = HTTPServer(('0.0.0.0', port), ProxyHandler)
     print(f"OpenAI proxy listening on http://0.0.0.0:{port}")
     print(f"Upstream: {cfg['base_url']}")
-    print(f"Keys: {len(cfg['api_keys'])}, fail_threshold={cfg['fail_threshold']}, ban_duration={cfg['ban_duration']}s")
+    print(f"Keys: {len(cfg['api_keys'])}, fail_threshold={cfg['fail_threshold']}, ban_duration={cfg['ban_duration']}s, ban_step={cfg['ban_step']}, max_ban={cfg['max_ban']}s")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
