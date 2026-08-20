@@ -276,7 +276,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         t0 = time.time()
         try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
+            with urllib.request.urlopen(req) as resp:
                 pool.report(key, True, time.time() - t0)
                 self.send_response(resp.status)
                 for k, v in resp.headers.items():
